@@ -1,0 +1,257 @@
+name: Build JioHotstar Patched APK
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Run every 6 hours to check for new versions
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Force build even if version unchanged'
+        required: false
+        default: 'true'
+        type: boolean
+
+env:
+  JAVA_VERSION: '17'
+  APKTOOL_VERSION: '2.9.3'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: 'false'
+
+      - name: Remove dangling submodule reference
+        run: |
+          if [ -f ".gitmodules" ]; then
+            cat .gitmodules
+          fi
+          # Remove the dangling 'bundle' submodule if it exists as a gitlink
+          if git ls-files --stage | grep -q "^160000.*bundle$"; then
+            echo "Removing dangling bundle submodule reference..."
+            git rm -f bundle 2>/dev/null || true
+            git add .
+            # Don't commit — just clean up for this build
+          fi
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq curl wget unzip zip python3 python3-pip
+          pip3 install requests --quiet 2>/dev/null || true
+
+      - name: Install apktool
+        run: |
+          curl -sL -o /usr/local/bin/apktool.jar \
+            "https://github.com/iBotPeaches/Apktool/releases/download/v${APKTOOL_VERSION}/apktool_${APKTOOL_VERSION}.jar"
+          printf '#!/bin/bash\nexec java -jar /usr/local/bin/apktool.jar "$@"\n' > /usr/local/bin/apktool
+          chmod +x /usr/local/bin/apktool
+          apktool --version
+
+      - name: Find Android build-tools
+        id: bt
+        run: |
+          BT_DIR="$ANDROID_HOME/build-tools"
+          LATEST=$(ls "$BT_DIR" | sort -V | tail -1)
+          echo "path=$BT_DIR/$LATEST" >> $GITHUB_OUTPUT
+          echo "LATEST_BT=$BT_DIR/$LATEST" >> $GITHUB_ENV
+          export PATH="$BT_DIR/$LATEST:$PATH"
+          echo "PATH=$PATH" >> $GITHUB_ENV
+          echo "Using build-tools: $LATEST"
+          ls "$BT_DIR/$LATEST/"
+
+      # ── Cookie injection from GitHub Secrets ──
+      # REQUIRED: Set these secrets in your repo:
+      #   Settings -> Secrets and variables -> Actions -> New repository secret
+      #
+      #   COOKIES_SESSION_USER_UP  = your JWT token (sessionUserUP cookie)
+      #   COOKIES_USER_HID         = your Hotstar ID (userHID cookie)
+      #   COOKIES_USER_PID         = your Partner ID (userPID cookie)
+      #   COOKIES_DEVICE_ID        = your Device ID (deviceId cookie)
+      #
+      # HOW TO GET COOKIES:
+      #   1. Log into hotstar.com on Chrome
+      #   2. Open DevTools -> Application -> Cookies -> https://www.hotstar.com
+      #   3. Copy values for: sessionUserUP, userHID, userPID, deviceId
+
+      - name: Inject cookie files from secrets
+        run: |
+          mkdir -p cookies
+
+          # Write each cookie secret to its file
+          if [ -n "${{ secrets.COOKIES_SESSION_USER_UP }}" ]; then
+            printf '%s' "${{ secrets.COOKIES_SESSION_USER_UP }}" > cookies/sessionUserUP.txt
+            echo "sessionUserUP.txt: $(wc -c < cookies/sessionUserUP.txt) bytes"
+          else
+            echo "WARNING: COOKIES_SESSION_USER_UP secret not set!"
+          fi
+
+          if [ -n "${{ secrets.COOKIES_USER_HID }}" ]; then
+            printf '%s' "${{ secrets.COOKIES_USER_HID }}" > cookies/userHID.txt
+            echo "userHID.txt: $(wc -c < cookies/userHID.txt) bytes"
+          else
+            echo "WARNING: COOKIES_USER_HID secret not set!"
+          fi
+
+          if [ -n "${{ secrets.COOKIES_USER_PID }}" ]; then
+            printf '%s' "${{ secrets.COOKIES_USER_PID }}" > cookies/userPID.txt
+            echo "userPID.txt: $(wc -c < cookies/userPID.txt) bytes"
+          else
+            echo "WARNING: COOKIES_USER_PID secret not set!"
+          fi
+
+          if [ -n "${{ secrets.COOKIES_DEVICE_ID }}" ]; then
+            printf '%s' "${{ secrets.COOKIES_DEVICE_ID }}" > cookies/deviceId.txt
+            echo "deviceId.txt: $(wc -c < cookies/deviceId.txt) bytes"
+          else
+            echo "WARNING: COOKIES_DEVICE_ID secret not set!"
+          fi
+
+          # Create empty media_token if not set (app will fetch it from API)
+          printf '%s' "${{ secrets.COOKIES_MEDIA_TOKEN }}" > cookies/media_token.txt 2>/dev/null || \
+            printf '' > cookies/media_token.txt
+
+          echo ""
+          echo "Cookie files created:"
+          ls -la cookies/
+
+      - name: Download latest APK
+        id: download
+        run: |
+          bash fetch-apk.sh .
+        env:
+          GITHUB_ENV: ${{ github.env }}
+
+      - name: Get fetched version
+        id: version
+        run: |
+          VERSION="${FETCHED_VERSION:-unknown}"
+          echo "fetched_version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Downloaded version: $VERSION"
+
+      - name: Check if version changed
+        id: check_version
+        run: |
+          LAST_TAG=$(git tag --list 'v*' --sort=-version:refname | head -1 2>/dev/null || echo "")
+          LAST_VERSION="${LAST_TAG#v}"
+          LAST_VERSION="${LAST_VERSION%%-*}"
+          FETCHED="${FETCHED_VERSION:-unknown}"
+
+          if [ "$LAST_VERSION" = "$FETCHED" ] && [ "${{ github.event.inputs.force_build }}" != "true" ]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "Version unchanged: $FETCHED (last tag: $LAST_TAG)"
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+            echo "New version: $FETCHED (was: $LAST_VERSION)"
+          fi
+
+      - name: Build patched APK
+        if: steps.check_version.outputs.skip != 'true'
+        run: |
+          bash patch.sh .
+
+      - name: Get build info
+        if: steps.check_version.outputs.skip != 'true'
+        id: build_info
+        run: |
+          PATCHED_APK="build/jiohotstar_patched.apk"
+          if [ -f "$PATCHED_APK" ]; then
+            SIZE=$(du -h "$PATCHED_APK" | cut -f1)
+            echo "size=$SIZE" >> $GITHUB_OUTPUT
+            echo "Patched APK size: $SIZE"
+          else
+            echo "ERROR: Patched APK not found!"
+            exit 1
+          fi
+
+      - name: Rename APK with version
+        if: steps.check_version.outputs.skip != 'true'
+        run: |
+          VERSION="${FETCHED_VERSION:-unknown}"
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          BUILD_NAME="jiohotstar_patched_v${VERSION}-${TIMESTAMP}.apk"
+          cp build/jiohotstar_patched.apk "build/${BUILD_NAME}"
+          echo "build_name=$BUILD_NAME" >> $GITHUB_ENV
+          echo "Build: $BUILD_NAME"
+
+      - name: Create GitHub Release
+        if: steps.check_version.outputs.skip != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "v${{ steps.version.outputs.fetched_version }}-${{ github.run_number }}"
+          name: "JioHotstar v${{ steps.version.outputs.fetched_version }} Patched"
+          body: |
+            ## JioHotstar Patched APK
+
+            **Version:** ${{ steps.version.outputs.fetched_version }}
+            **Build:** #${{ github.run_number }}
+            **Date:** ${{ github.event.head_commit.timestamp || github.run_started_at }}
+            **Source:** dietdroid.com (Google Play)
+
+            ### Features
+            - Premium content access via cookie seeding
+            - Auto token refresh (DataStore + SharedPreferences)
+            - No root required
+
+            ### How to install
+            1. Uninstall existing JioHotstar
+            2. Download the APK from Assets below
+            3. Enable "Install from unknown sources"
+            4. Install the APK
+            5. Open and enjoy
+
+            > **Note:** Cookies expire. Update your GitHub Secrets when that happens.
+          files: |
+            build/${{ env.build_name }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload build artifact
+        if: steps.check_version.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: jiohotstar-patched-${{ steps.version.outputs.fetched_version }}
+          path: build/${{ env.build_name }}
+          retention-days: 30
+
+      - name: Build summary
+        if: always()
+        run: |
+          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Version | \`${FETCHED_VERSION:-unknown}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Source | dietdroid.com |" >> $GITHUB_STEP_SUMMARY
+          echo "| Trigger | ${{ github.event_name }} |" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.check_version.outputs.skip }}" = "true" ]; then
+            echo "| Status | Skipped (version unchanged) |" >> $GITHUB_STEP_SUMMARY
+          elif [ -f "build/${{ env.build_name }}" ]; then
+            echo "| Status | Built & Released |" >> $GITHUB_STEP_SUMMARY
+            echo "| Size | ${{ steps.build_info.outputs.size }} |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Status | Failed |" >> $GITHUB_STEP_SUMMARY
+          fi

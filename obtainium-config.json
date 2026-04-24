@@ -1,0 +1,22 @@
+{
+  "id": "jiohotstar-patched",
+  "name": "JioHotstar Patched",
+  "description": "JioHotstar with premium token injection via CookieSeeder architecture",
+  "url": "https://github.com/YOUR_USERNAME/jiohotstar-patcher/releases",
+  "trackOnly": false,
+  "versionDetection": {
+    "method": "releaseTag",
+    "tagPattern": "v(.+)"
+  },
+  "installation": {
+    "method": "downloadFromPage",
+    "selectLatestAsset": true,
+    "assetFilter": "jiohotstar_patched_.*\\.apk$"
+  },
+  "categories": [
+    "Streaming",
+    "Android",
+    "Patched"
+  ],
+  "notes": "Replace YOUR_USERNAME with your actual GitHub username in the URL field. This config works with the GitHub Actions workflow that creates releases on every push to cookies/ or patches/."
+}
